@@ -1,0 +1,69 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid_root_part = character:WaitForChild("HumanoidRootPart")
+
+local cleanup_distance = 500
+local cleanup_interval = 5
+local max_actors = 2
+
+if not checkparallel then
+    return
+end
+
+local function heavy_cleanup_task()
+    while true do
+        task.desynchronize()
+        local player_pos = humanoid_root_part.Position
+        local to_clean = {}
+        for _, obj in pairs(Workspace:GetChildren()) do
+            if obj:IsA("BasePart") and obj ~= character then
+                local dist = (obj.Position - player_pos).Magnitude
+                if dist > cleanup_distance then
+                    table.insert(to_clean, obj)
+                end
+            end
+        end
+        task.synchronize()
+        for _, obj in to_clean do
+            obj.Transparency = 1
+            obj.CanCollide = false
+        end
+        task.wait(cleanup_interval)
+    end
+end
+
+local function setup_optimization()
+    local active_actors = getactors() or {}
+    local needed_actors = math.max(1, max_actors - #active_actors)
+    
+    for i = 1, needed_actors do
+        local new_actor = Instance.new("Actor")
+        new_actor.Name = "optimization_actor_" .. i
+        new_actor.Parent = Workspace
+        
+        run_on_actor(new_actor, heavy_cleanup_task)
+    end
+    
+    local channel = create_comm_channel("opt_channel")
+end
+
+if checkparallel() then
+    setup_optimization()
+else
+    spawn(setup_optimization)
+end
+
+RunService.Heartbeat:Connect(function()
+    local actors = getactors() or {}
+    for _, actor in pairs(actors) do
+        local threads = getactorthreads(actor)
+        if #threads == 0 then
+            setup_optimization()
+            break
+        end
+    end
+end)
