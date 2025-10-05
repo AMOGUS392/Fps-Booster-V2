@@ -7,6 +7,7 @@ local math_sqrt = math.sqrt
 local math_abs = math.abs
 local math_min = math.min
 local math_max = math.max
+local math_floor = math.floor
 local table_sort = table.sort
 local table_clear = table.clear
 local table_remove = table.remove
@@ -31,18 +32,33 @@ local config = {
     safe_zone = 75,
     floor_protection_radius = 50,
     floor_vertical_offset = 3,
-    raycast_distance = 50,
+    floor_check_distance = 10,
     objects_per_frame = 60,
     min_per_frame = 30,
-    max_per_frame = 120,
+    max_per_frame = 150,
     adjustment_interval = 0.5,
     scan_interval = 0.35,
     fps_sample_count = 22,
     aggressive_mode_threshold = 40,
     extreme_mode_threshold = 20,
-    extreme_cleanup_distance = 30,
+    super_extreme_threshold = 15,
+    ultra_extreme_distance_min = 50,
+    ultra_extreme_distance_max = 100,
     vertical_safe_zone = 18,
-    restore_multiplier = 0.65
+    restore_multiplier = 0.75
+}
+
+local stability_system = {
+    last_aggressive_trigger = 0,
+    cooldown_duration = 5,
+    slow_restoration_duration = 10,
+    fps_trend = table.create(10),
+    trend_index = 1,
+    trend_window = 10,
+    restoration_speed = 1.0,
+    min_stable_fps = 40,
+    extreme_mode_active = false,
+    current_mode = "normal"
 }
 
 local hidden_folder = ReplicatedStorage:FindFirstChild("HiddenObjects") or Instance.new("Folder")
@@ -59,10 +75,10 @@ local protected_parts = {}
 local player_characters = {}
 local last_cache_update = 0
 local last_cache_cleanup = 0
-local last_raycast_check = 0
+local last_protection_check = 0
 local cache_interval = 9
 local cache_cleanup_interval = 30
-local raycast_interval = 0.5
+local protection_check_interval = 0.5
 
 local fps_samples = table.create(config.fps_sample_count)
 local fps_index = 1
@@ -71,10 +87,7 @@ local current_fps = 60
 local last_frame_time = os_clock()
 local aggressive_mode = false
 local extreme_mode = false
-
-local raycast_params = RaycastParams.new()
-raycast_params.FilterType = Enum.RaycastFilterType.Exclude
-raycast_params.IgnoreWater = true
+local super_extreme_mode = false
 
 local EFFECT_CLASSES = {
     ParticleEmitter = true,
@@ -179,10 +192,10 @@ end
 
 local function update_protected_parts()
     local current_time = os_clock()
-    if current_time - last_raycast_check < raycast_interval then
+    if current_time - last_protection_check < protection_check_interval then
         return
     end
-    last_raycast_check = current_time
+    last_protection_check = current_time
     
     table_clear(protected_parts)
     
@@ -192,24 +205,28 @@ local function update_protected_parts()
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
     
-    raycast_params.FilterDescendantsInstances = {char, hidden_folder}
+    local player_pos = hrp.Position
+    local check_distance = config.floor_check_distance
+    local vertical_check = 50
     
-    local origin = hrp.Position
-    local direction = Vector3.new(0, -config.raycast_distance, 0)
-    
-    local raycast_result = Workspace:Raycast(origin, direction, raycast_params)
-    
-    if raycast_result and raycast_result.Instance then
-        local hit_part = raycast_result.Instance
-        protected_parts[hit_part] = true
-        
-        local parent = hit_part.Parent
-        if parent and parent:IsA("Model") then
-            for _, part in pairs(parent:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    protected_parts[part] = true
+    for i = 1, #cached_parts do
+        local obj = cached_parts[i]
+        if obj and obj.Parent then
+            pcall(function()
+                local obj_pos = obj.Position
+                
+                if obj_pos.Y < player_pos.Y and obj_pos.Y > player_pos.Y - vertical_check then
+                    local dx = obj_pos.X - player_pos.X
+                    local dz = obj_pos.Z - player_pos.Z
+                    local horizontal_dist_sq = dx * dx + dz * dz
+                    
+                    if horizontal_dist_sq < (check_distance * check_distance) then
+                        if is_floor_or_terrain(obj) then
+                            protected_parts[obj] = true
+                        end
+                    end
                 end
-            end
+            end)
         end
     end
 end
@@ -355,41 +372,139 @@ local function calculate_average_fps()
     return fps_sum / count
 end
 
+local function calculate_fps_trend()
+    local trend_count = 0
+    for i = 1, stability_system.trend_window do
+        if stability_system.fps_trend[i] then
+            trend_count = trend_count + 1
+        end
+    end
+    
+    if trend_count < 5 then return 0 end
+    
+    local sum = 0
+    local valid_diffs = 0
+    for i = 1, trend_count - 1 do
+        local current_val = stability_system.fps_trend[i]
+        local next_val = stability_system.fps_trend[i + 1]
+        if current_val and next_val then
+            sum = sum + (next_val - current_val)
+            valid_diffs = valid_diffs + 1
+        end
+    end
+    
+    if valid_diffs == 0 then return 0 end
+    return sum / valid_diffs
+end
+
+local function update_stability_system(current_fps)
+    stability_system.fps_trend[stability_system.trend_index] = current_fps
+    stability_system.trend_index = stability_system.trend_index % stability_system.trend_window + 1
+    
+    local current_time = os_clock()
+    local time_since_extreme = current_time - stability_system.last_aggressive_trigger
+    
+    if current_fps < config.extreme_mode_threshold then
+        stability_system.restoration_speed = 0
+        return
+    end
+    
+    if time_since_extreme < stability_system.cooldown_duration then
+        stability_system.restoration_speed = 0
+        return
+    end
+    
+    if time_since_extreme < (stability_system.cooldown_duration + stability_system.slow_restoration_duration) then
+        if current_fps < stability_system.min_stable_fps then
+            stability_system.extreme_mode_active = true
+            stability_system.last_aggressive_trigger = current_time
+            stability_system.restoration_speed = 0
+        else
+            stability_system.restoration_speed = 0.3
+        end
+        return
+    end
+    
+    local fps_trend = calculate_fps_trend()
+    
+    if current_fps < stability_system.min_stable_fps then
+        stability_system.extreme_mode_active = true
+        stability_system.last_aggressive_trigger = current_time
+        stability_system.restoration_speed = 0
+    elseif fps_trend < -1.5 then
+        stability_system.restoration_speed = 0.3
+    elseif fps_trend > 0.5 and current_fps > stability_system.min_stable_fps + 5 then
+        stability_system.restoration_speed = 1.0
+    else
+        stability_system.restoration_speed = 0.5
+    end
+end
+
 local function adjust_parameters()
     local avg_fps = calculate_average_fps()
     current_fps = avg_fps
     
-    if avg_fps < config.extreme_mode_threshold then
+    update_stability_system(avg_fps)
+    
+    if avg_fps < config.super_extreme_threshold or (stability_system.extreme_mode_active and avg_fps < config.extreme_mode_threshold) then
+        super_extreme_mode = true
         extreme_mode = true
         aggressive_mode = true
-        config.cleanup_distance = config.extreme_cleanup_distance
-        config.objects_per_frame = math_min(config.max_per_frame, config.objects_per_frame * 2)
+        stability_system.last_aggressive_trigger = os_clock()
+        stability_system.extreme_mode_active = false
+        stability_system.current_mode = "ultra_extreme"
+        
+        local fps_ratio = math_max(0, math_min(1, (avg_fps - 5) / 10))
+        config.cleanup_distance = config.ultra_extreme_distance_min + 
+            (config.ultra_extreme_distance_max - config.ultra_extreme_distance_min) * fps_ratio
+        
+        config.objects_per_frame = 150
         config.safe_zone = 30
+    elseif avg_fps < config.extreme_mode_threshold or stability_system.extreme_mode_active then
+        super_extreme_mode = false
+        extreme_mode = true
+        aggressive_mode = true
+        stability_system.last_aggressive_trigger = os_clock()
+        stability_system.extreme_mode_active = false
+        stability_system.current_mode = "extreme"
+        
+        config.cleanup_distance = 280
+        config.objects_per_frame = math_min(config.max_per_frame, 120)
+        config.safe_zone = 50
     elseif avg_fps < config.aggressive_mode_threshold then
+        super_extreme_mode = false
         extreme_mode = false
         aggressive_mode = true
-        config.cleanup_distance = math_min(config.max_distance, config.cleanup_distance + 65)
-        config.objects_per_frame = math_max(config.min_per_frame, config.objects_per_frame - 15)
-        config.safe_zone = math_max(50, config.safe_zone - 3)
+        stability_system.current_mode = "aggressive"
+        
+        config.cleanup_distance = math_min(config.max_distance, 345)
+        config.objects_per_frame = math_max(config.min_per_frame, 45)
+        config.safe_zone = 60
     elseif avg_fps < config.target_fps - 5 then
+        super_extreme_mode = false
         extreme_mode = false
         aggressive_mode = false
+        stability_system.current_mode = "normal"
+        
         config.cleanup_distance = math_min(config.max_distance, config.cleanup_distance + 50)
         config.objects_per_frame = math_max(config.min_per_frame, config.objects_per_frame - 10)
-    elseif avg_fps > config.target_fps + 10 then
+    elseif avg_fps > config.target_fps + 10 and stability_system.restoration_speed > 0 then
+        super_extreme_mode = false
         extreme_mode = false
         aggressive_mode = false
+        stability_system.current_mode = "normal"
+        
         config.cleanup_distance = math_max(config.min_distance, config.cleanup_distance - 35)
         config.objects_per_frame = math_min(config.max_per_frame, config.objects_per_frame + 12)
         config.safe_zone = math_min(75, config.safe_zone + 2)
     end
     
     local object_count = #cached_parts
-    if object_count > 5000 then
+    if object_count > 5000 and stability_system.restoration_speed > 0 then
         config.objects_per_frame = math_max(config.min_per_frame, config.objects_per_frame - 12)
-    elseif object_count > 3500 then
+    elseif object_count > 3500 and stability_system.restoration_speed > 0 then
         config.objects_per_frame = math_max(config.min_per_frame, config.objects_per_frame - 5)
-    elseif object_count < 1800 then
+    elseif object_count < 1800 and stability_system.restoration_speed > 0 then
         config.objects_per_frame = math_min(config.max_per_frame, config.objects_per_frame + 8)
     end
 end
@@ -449,17 +564,10 @@ task.spawn(function()
         table_clear(parts_to_hide)
         hide_index = 1
         
-        local effective_distance
-        if extreme_mode then
-            effective_distance = config.extreme_cleanup_distance
-        elseif aggressive_mode then
-            effective_distance = config.cleanup_distance * 0.8
-        else
-            effective_distance = config.cleanup_distance
-        end
+        local effective_distance = config.cleanup_distance
         
         local count = 0
-        local check_safe_zone = not extreme_mode
+        local check_safe_zone = not super_extreme_mode
         local hidden_check = hidden_folder
         local protected_check = protected_parts
         
@@ -507,6 +615,10 @@ task.spawn(function()
     while true do
         task.wait(config.scan_interval + 0.15)
         
+        if stability_system.restoration_speed == 0 then
+            continue
+        end
+        
         local char = player.Character
         if not char then continue end
         
@@ -553,15 +665,23 @@ RunService.Heartbeat:Connect(function()
     end
     
     local char = player.Character
-    local effective_per_frame = extreme_mode and config.objects_per_frame * 2 
-        or (aggressive_mode and config.objects_per_frame * 1.35 or config.objects_per_frame)
+    local effective_per_frame
+    if super_extreme_mode then
+        effective_per_frame = config.objects_per_frame * 3
+    elseif extreme_mode then
+        effective_per_frame = config.objects_per_frame * 2.5
+    elseif aggressive_mode then
+        effective_per_frame = config.objects_per_frame * 1.35
+    else
+        effective_per_frame = config.objects_per_frame
+    end
+    
     local parts_to_hide_count = #parts_to_hide
     local parts_to_restore_count = #parts_to_restore
-    local obj_per_frame = config.objects_per_frame
     
     if char then
         local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp then
+        if hrp and stability_system.restoration_speed > 0 then
             local restore_list = parts_to_restore
             for i = #restore_list, 1, -1 do
                 local entry = restore_list[i]
@@ -601,25 +721,31 @@ RunService.Heartbeat:Connect(function()
         hide_index = 1
     end
     
-    local processed_restore = 0
-    local restore_list = parts_to_restore
-    
-    while processed_restore < obj_per_frame and restore_index <= parts_to_restore_count do
-        local entry = restore_list[restore_index]
-        if entry and entry.obj then
-            local parent = original_parents[entry.obj]
-            if parent and parent:IsDescendantOf(game) then
-                entry.obj.Parent = parent
-                original_parents[entry.obj] = nil
-                enable_effects(entry.obj)
+    if stability_system.restoration_speed > 0 then
+        local base_per_frame = config.objects_per_frame
+        local adjusted_per_frame = math_floor(base_per_frame * stability_system.restoration_speed)
+        adjusted_per_frame = math_max(5, adjusted_per_frame)
+        
+        local processed_restore = 0
+        local restore_list = parts_to_restore
+        
+        while processed_restore < adjusted_per_frame and restore_index <= parts_to_restore_count do
+            local entry = restore_list[restore_index]
+            if entry and entry.obj then
+                local parent = original_parents[entry.obj]
+                if parent and parent:IsDescendantOf(game) then
+                    entry.obj.Parent = parent
+                    original_parents[entry.obj] = nil
+                    enable_effects(entry.obj)
+                end
             end
+            
+            restore_index = restore_index + 1
+            processed_restore = processed_restore + 1
         end
         
-        restore_index = restore_index + 1
-        processed_restore = processed_restore + 1
-    end
-    
-    if restore_index > parts_to_restore_count then
-        restore_index = 1
+        if restore_index > parts_to_restore_count then
+            restore_index = 1
+        end
     end
 end)
