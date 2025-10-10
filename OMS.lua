@@ -172,7 +172,7 @@ local function scan_effects_immediate(part)
     if effect_cache[part] then
         return
     end
-    local effects = nil
+    local effects
     local descendants = part:GetDescendants()
     for i = 1, #descendants do
         local desc = descendants[i]
@@ -180,7 +180,9 @@ local function scan_effects_immediate(part)
         if class == "ParticleEmitter" or class == "Smoke" or class == "Fire" or
             class == "Sparkles" or class == "PointLight" or class == "SpotLight" or
             class == "Sound" then
-            effects = effects or table.create(4)
+            if not effects then
+                effects = table.create(4)
+            end
             local state = { effect = desc }
             if desc:IsA("Sound") then
                 state.was_playing = desc.Playing
@@ -298,7 +300,7 @@ local function adjust_parameters()
             new_objects = math.min(config.max_per_frame, state.objects_per_frame + 12)
             new_safe_zone = math.max(config.safe_zone, state.safe_zone + 5)
         else
-            new_cleanup = math.max(state.cleanup_distance - 20, config.cleanup_distance)
+            new_cleanup = math.max(config.cleanup_distance, state.cleanup_distance - 20)
             new_objects = math.max(config.min_per_frame, state.objects_per_frame - 6)
             new_safe_zone = math.max(config.safe_zone, state.safe_zone - 2)
         end
@@ -306,7 +308,7 @@ local function adjust_parameters()
 
     stability_system.restoration_speed = new_restoration_speed
     state.cleanup_distance = math.min(config.max_distance, math.max(config.cleanup_distance, new_cleanup))
-    state.objects_per_frame = math.clamp(new_objects, config.min_per_frame, config.max_per_frame)
+    state.objects_per_frame = math.max(config.min_per_frame, math.min(config.max_per_frame, new_objects))
     state.safe_zone = math.max(config.safe_zone, new_safe_zone)
 end
 
@@ -359,6 +361,15 @@ Workspace.DescendantRemoving:Connect(function(obj)
     end
 end)
 
+hidden_folder.DescendantRemoving:Connect(function(obj)
+    all_parts[obj] = nil
+    floor_cache[obj] = nil
+    extent_cache[obj] = nil
+    effect_cache[obj] = nil
+    original_parents[obj] = nil
+    pending_hide[obj] = nil
+end)
+
 task.spawn(rebuild_part_list)
 
 task.spawn(function()
@@ -388,8 +399,6 @@ task.spawn(function()
         local camera = Workspace.CurrentCamera
         local cleanup_radius = state.cleanup_distance
         local safe_zone_radius = state.safe_zone
-        local cleanup_radius_sq = cleanup_radius * cleanup_radius
-        local safe_zone_sq = safe_zone_radius * safe_zone_radius
 
         local hide_count = 0
         for part in pairs(all_parts) do
@@ -434,7 +443,7 @@ task.spawn(function()
             end
 
             if should_hide then
-                hide_count += 1
+                hide_count = hide_count + 1
                 parts_to_hide[hide_count] = part
             end
         end
@@ -459,7 +468,6 @@ task.spawn(function()
         restore_index = 1
 
         local restore_radius = state.cleanup_distance * config.restore_multiplier
-        local restore_radius_sq = restore_radius * restore_radius
 
         local children = hidden_folder:GetChildren()
         local restore_count = 0
@@ -475,7 +483,7 @@ task.spawn(function()
                 local bounding_radius = get_bounding_radius(obj)
                 local limit = restore_radius + bounding_radius
                 if dist_sq <= limit * limit then
-                    restore_count += 1
+                    restore_count = restore_count + 1
                     parts_to_restore[restore_count] = obj
                 end
             end
@@ -524,7 +532,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
             end)
             pending_hide[obj] = nil
 
-            if not success then
+            if success then
+                all_parts[obj] = nil
+            else
                 all_parts[obj] = nil
                 original_parents[obj] = nil
                 floor_cache[obj] = nil
@@ -532,8 +542,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
                 effect_cache[obj] = nil
             end
         end
-        hide_index += 1
-        processed_hide += 1
+        hide_index = hide_index + 1
+        processed_hide = processed_hide + 1
     end
 
     if hide_index > parts_to_hide_count then
@@ -560,6 +570,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
                             original_parents[obj] = nil
                             all_parts[obj] = true
                             floor_cache[obj] = nil
+                            extent_cache[obj] = nil
                         else
                             original_parents[obj] = nil
                         end
@@ -567,8 +578,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
                         original_parents[obj] = nil
                     end
                 end
-                restore_index += 1
-                processed_restore += 1
+                restore_index = restore_index + 1
+                processed_restore = processed_restore + 1
             end
 
             if restore_index > parts_to_restore_count then
