@@ -47,10 +47,10 @@ local stability_system = {
     restoration_speed = 1.0
 }
 
-local hidden_folder = ReplicatedStorage:FindFirstChild("HiddenObjects")
+local hidden_folder = ReplicatedStorage:FindFirstChild("HiddenObjects_LOD")
 if not hidden_folder then
     hidden_folder = Instance.new("Folder")
-    hidden_folder.Name = "HiddenObjects"
+    hidden_folder.Name = "HiddenObjects_LOD"
     hidden_folder.Parent = ReplicatedStorage
 end
 
@@ -101,6 +101,10 @@ end
 
 local function is_camera_part(part, camera)
     return camera and part:IsDescendantOf(camera)
+end
+
+local function is_pooled_object(part)
+    return part:GetAttribute("_PooledObject") == true
 end
 
 local function is_player_part(part)
@@ -342,7 +346,8 @@ local function rebuild_part_list()
             and not obj:IsDescendantOf(workspace_terrain)
             and not obj:IsDescendantOf(hidden_folder)
             and not is_player_part(obj)
-            and not is_camera_part(obj, camera) then
+            and not is_camera_part(obj, camera)
+            and not is_pooled_object(obj) then
             all_parts[obj] = true
         end
     end
@@ -356,7 +361,8 @@ Workspace.DescendantAdded:Connect(function(obj)
         or obj:IsDescendantOf(workspace_terrain)
         or obj:IsDescendantOf(hidden_folder)
         or is_player_part(obj)
-        or is_camera_part(obj, Workspace.CurrentCamera) then
+        or is_camera_part(obj, Workspace.CurrentCamera)
+        or is_pooled_object(obj) then
         return
     end
     all_parts[obj] = true
@@ -423,6 +429,9 @@ task.spawn(function()
                 continue
             end
             if is_large_floor(part) then
+                continue
+            end
+            if is_pooled_object(part) then
                 continue
             end
 
@@ -534,7 +543,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
 
     while processed_hide < effective_per_frame and hide_index <= parts_to_hide_count do
         local obj = parts_to_hide[hide_index]
-        if obj and obj.Parent and obj.Parent ~= hidden_folder and not is_player_part(obj) and not is_camera_part(obj, camera) then
+        if obj and obj.Parent and obj.Parent ~= hidden_folder and not is_player_part(obj) and not is_camera_part(obj, camera) and not is_pooled_object(obj) then
             pending_hide[obj] = true
             local success = pcall(function()
                 scan_effects_immediate(obj)
