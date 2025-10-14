@@ -3,611 +3,661 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local math_sqrt = math.sqrt
-local math_max = math.max
-local math_min = math.min
-local math_floor = math.floor
-local os_clock = os.clock
-local table_clear = table.clear
+local fastSqrt = math.sqrt
+local fastMax = math.max
+local fastMin = math.min
+local fastFloor = math.floor
+local fastClamp = math.clamp
+local osClock = os.clock
+local clearTable = table.clear
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
-local humanoid_root_part = character:WaitForChild("HumanoidRootPart")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 
 local config = {
-    target_fps = 50,
-    cleanup_distance = 280,
-    min_distance = 220,
-    max_distance = 450,
-    safe_zone = 75,
-    objects_per_frame = 60,
-    min_per_frame = 30,
-    max_per_frame = 150,
-    adjustment_interval = 0.5,
-    scan_interval = 0.35,
-    fps_sample_count = 22,
-    aggressive_mode_threshold = 40,
-    extreme_mode_threshold = 20,
-    super_extreme_threshold = 15,
-    ultra_extreme_distance_min = 50,
-    ultra_extreme_distance_max = 100,
-    restore_multiplier = 0.75,
-    floor_min_area = 500,
-    floor_max_height = 8
+	target_fps = 50,
+	cleanup_distance = 280,
+	min_distance = 220,
+	max_distance = 450,
+	safe_zone = 75,
+	objects_per_frame = 60,
+	min_per_frame = 30,
+	max_per_frame = 150,
+	adjustment_interval = 0.5,
+	scan_interval = 0.35,
+	fps_sample_count = 22,
+	aggressive_mode_threshold = 40,
+	extreme_mode_threshold = 20,
+	super_extreme_threshold = 15,
+	ultra_extreme_distance_min = 50,
+	ultra_extreme_distance_max = 100,
+	restore_multiplier = 0.75,
+	floor_min_area = 500,
+	floor_max_height = 8
 }
 
 local state = {
-    cleanup_distance = config.cleanup_distance,
-    safe_zone = config.safe_zone,
-    objects_per_frame = config.objects_per_frame
+	cleanup_distance = config.cleanup_distance,
+	safe_zone = config.safe_zone,
+	objects_per_frame = config.objects_per_frame
 }
 
-local stability_system = {
-    last_aggressive_trigger = 0,
-    restoration_speed = 1.0
+local stabilitySystem = {
+	last_aggressive_trigger = 0,
+	restoration_speed = 1.0
 }
 
-local hidden_folder = ReplicatedStorage:FindFirstChild("HiddenObjects_LOD")
-if not hidden_folder then
-    hidden_folder = Instance.new("Folder")
-    hidden_folder.Name = "HiddenObjects_LOD"
-    hidden_folder.Parent = ReplicatedStorage
+local hiddenFolder = ReplicatedStorage:FindFirstChild("HiddenObjects_LOD")
+if not hiddenFolder then
+	hiddenFolder = Instance.new("Folder")
+	hiddenFolder.Name = "HiddenObjects_LOD"
+	hiddenFolder.Parent = ReplicatedStorage
 end
 
-local original_parents = {}
-local pending_hide = {}
-local all_parts = {}
-local parts_to_hide = table.create(500)
-local parts_to_restore = table.create(500)
-local player_characters = {}
-local floor_cache = {}
-local effect_cache = setmetatable({}, { __mode = "k" })
-local extent_cache = {}
+local originalParents = {}
+local pendingHide = {}
+local allParts = {}
+local partsToHide = table.create(1024)
+local partsToRestore = table.create(512)
+local largeFloorWhitelist = {}
+local partsToEvict = table.create(128)
 
-local overlap_params = OverlapParams.new()
-overlap_params.FilterType = Enum.RaycastFilterType.Exclude
-overlap_params.MaxParts = 10000
+local partsToHideLen = 0
+local partsToRestoreLen = 0
+local partsToEvictLen = 0
 
-local fps_samples = table.create(config.fps_sample_count, config.target_fps)
-local fps_index = 1
-local fps_sum = config.target_fps * config.fps_sample_count
+local playerCharacters = {}
+local floorCache = {}
+local effectCache = setmetatable({}, { __mode = "k" })
+local extentCache = {}
 
-local aggressive_mode = false
-local extreme_mode = false
-local super_extreme_mode = false
+local fpsSamples = table.create(config.fps_sample_count, config.target_fps)
+local fpsIndex = 1
+local fpsSum = config.target_fps * config.fps_sample_count
 
-local workspace_terrain = Workspace.Terrain
+local aggressiveMode = false
+local extremeMode = false
+local superExtremeMode = false
 
-local vertical_check_threshold = 18
-local vertical_check_sq = vertical_check_threshold * vertical_check_threshold
-local safe_zone_multiplier = 1.69
-local tight_radius_base = 30
-local fps_ratio_min = 5
-local fps_ratio_range = 10
+local workspaceTerrain = Workspace.Terrain
 
-local function refresh_character_reference()
-    if not character or not character.Parent then
-        character = player.Character
-    end
-    if character then
-        if not humanoid_root_part or humanoid_root_part.Parent ~= character then
-            humanoid_root_part = character:FindFirstChild("HumanoidRootPart")
-        end
-    else
-        humanoid_root_part = nil
-    end
-    return humanoid_root_part ~= nil
+local verticalCheckThreshold = 18
+local safeZoneMultiplier = 1.69
+local tightRadiusBase = 30
+local fpsRatioMin = 5
+local fpsRatioRange = 10
+
+local function refreshCharacterReference()
+	if not character or not character.Parent then
+		character = player.Character
+	end
+	if character then
+		if not humanoidRootPart or humanoidRootPart.Parent ~= character then
+			humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+		end
+	else
+		humanoidRootPart = nil
+	end
+	return humanoidRootPart ~= nil
 end
 
-local function is_camera_part(part, camera)
-    return camera and part:IsDescendantOf(camera)
+local function isCameraPart(part, camera)
+	return camera and part:IsDescendantOf(camera)
 end
 
-local function is_pooled_object(part)
-    return part:GetAttribute("_PooledObject") == true
+local function isPooledObject(part)
+	return part:GetAttribute("_PooledObject") == true
 end
 
-local function is_player_part(part)
-    local current = part
-    while current and current ~= Workspace do
-        if player_characters[current] then
-            return true
-        end
-        current = current.Parent
-    end
-    return false
+local function isPlayerPart(part)
+	local current = part
+	while current and current ~= Workspace do
+		if playerCharacters[current] then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
 end
 
-local function update_player_characters()
-    table_clear(player_characters)
-    local players_list = Players:GetPlayers()
-    local player_count = #players_list
-    local filter = table.create(player_count)
+local function cleanupTracking(part)
+	allParts[part] = nil
+	floorCache[part] = nil
+	extentCache[part] = nil
+	largeFloorWhitelist[part] = nil
+	originalParents[part] = nil
+	effectCache[part] = nil
+	pendingHide[part] = nil
+end
 
-    for i = 1, player_count do
-        local plr = players_list[i]
-        local char = plr.Character
-        if char then
-            player_characters[char] = true
-            filter[#filter + 1] = char
+local function trackPart(part, camera)
+	if not part:IsA("BasePart") then
+		return
+	end
+	if part == workspaceTerrain
+		or part:IsDescendantOf(workspaceTerrain)
+		or part:IsDescendantOf(hiddenFolder)
+		or isPlayerPart(part)
+		or isPooledObject(part)
+		or (camera and isCameraPart(part, camera)) then
+		return
+	end
+	allParts[part] = true
+	floorCache[part] = nil
+	extentCache[part] = nil
+end
 
-            local descendants = char:GetDescendants()
-            local desc_count = #descendants
-            for j = 1, desc_count do
-                local desc = descendants[j]
-                if desc:IsA("BasePart") then
-                    all_parts[desc] = nil
-                    floor_cache[desc] = nil
-                    extent_cache[desc] = nil
-                end
-            end
-        end
-    end
+local function detachCharacterParts(characterModel)
+	local descendants = characterModel:GetDescendants()
+	for i = 1, #descendants do
+		local desc = descendants[i]
+		if desc:IsA("BasePart") then
+			cleanupTracking(desc)
+		end
+	end
+end
 
-    overlap_params.FilterDescendantsInstances = filter
+local function updatePlayerCharacters()
+	clearTable(playerCharacters)
+
+	local playersList = Players:GetPlayers()
+	for i = 1, #playersList do
+		local plr = playersList[i]
+		local char = plr.Character
+		if char then
+			playerCharacters[char] = true
+			detachCharacterParts(char)
+		end
+	end
 end
 
 player.CharacterAdded:Connect(function(char)
-    character = char
-    humanoid_root_part = char:WaitForChild("HumanoidRootPart")
-    update_player_characters()
+	character = char
+	humanoidRootPart = char:WaitForChild("HumanoidRootPart")
+	updatePlayerCharacters()
+end)
+
+player.CharacterRemoving:Connect(function()
+	humanoidRootPart = nil
 end)
 
 Players.PlayerAdded:Connect(function(plr)
-    plr.CharacterAdded:Connect(update_player_characters)
+	plr.CharacterAdded:Connect(function()
+		updatePlayerCharacters()
+	end)
+	plr.CharacterRemoving:Connect(function(char)
+		if char then
+			detachCharacterParts(char)
+		end
+	end)
 end)
 
-Players.PlayerRemoving:Connect(update_player_characters)
+Players.PlayerRemoving:Connect(function(plr)
+	local char = plr.Character
+	if char then
+		detachCharacterParts(char)
+	end
+	updatePlayerCharacters()
+end)
 
-update_player_characters()
-refresh_character_reference()
+updatePlayerCharacters()
+refreshCharacterReference()
 
-local function is_large_floor(part)
-    local cached = floor_cache[part]
-    if cached ~= nil then
-        return cached
-    end
-    local size = part.Size
-    local horizontal_area = size.X * size.Z
-    local is_floor = size.Y <= config.floor_max_height and horizontal_area >= config.floor_min_area
-    floor_cache[part] = is_floor
-    return is_floor
+local function isLargeFloor(part)
+	local cached = floorCache[part]
+	if cached ~= nil then
+		return cached
+	 end
+	local size = part.Size
+	if size.Y > config.floor_max_height then
+		floorCache[part] = false
+		return false
+	end
+	local horizontalArea = size.X * size.Z
+	local isFloor = horizontalArea >= config.floor_min_area
+	floorCache[part] = isFloor
+	if isFloor then
+		largeFloorWhitelist[part] = true
+	end
+	return isFloor
 end
 
-local function get_bounding_radius(part)
-    local cached = extent_cache[part]
-    if cached then
-        return cached
-    end
-    local size = part.Size
-    local half_x = size.X * 0.5
-    local half_y = size.Y * 0.5
-    local half_z = size.Z * 0.5
-    local radius = math_sqrt(half_x * half_x + half_y * half_y + half_z * half_z)
-    extent_cache[part] = radius
-    return radius
+local function getBoundingRadius(part)
+	local cached = extentCache[part]
+	if cached then
+		return cached
+	end
+	local size = part.Size
+	local halfX = size.X * 0.5
+	local halfY = size.Y * 0.5
+	local halfZ = size.Z * 0.5
+	local radius = fastSqrt(halfX * halfX + halfY * halfY + halfZ * halfZ)
+	extentCache[part] = radius
+	return radius
 end
 
-local function scan_effects_immediate(part)
-    if effect_cache[part] then
-        return
-    end
-    local effects
-    local descendants = part:GetDescendants()
-    local desc_count = #descendants
-    for i = 1, desc_count do
-        local desc = descendants[i]
-        local class = desc.ClassName
-        if class == "ParticleEmitter" or class == "PointLight" or class == "SpotLight" or 
-            class == "Sound" or class == "Fire" or class == "Smoke" or class == "Sparkles" then
-            if not effects then
-                effects = table.create(4)
-            end
-            local state = { effect = desc }
-            if class == "Sound" then
-                state.was_playing = desc.Playing
-            else
-                state.was_enabled = desc.Enabled
-            end
-            effects[#effects + 1] = state
-        end
-    end
-    if effects then
-        effect_cache[part] = effects
-    end
+local function scanEffectsImmediate(part)
+	if effectCache[part] then
+		return
+	end
+
+	local effects = nil
+	local descendants = part:GetDescendants()
+	for i = 1, #descendants do
+		local desc = descendants[i]
+		local class = desc.ClassName
+
+		if class == "ParticleEmitter"
+			or class == "PointLight"
+			or class == "SpotLight"
+			or class == "Sound"
+			or class == "Fire"
+			or class == "Smoke"
+			or class == "Sparkles" then
+
+			effects = effects or table.create(6)
+			local state = {
+				effect = desc,
+				was_enabled = class ~= "Sound" and desc.Enabled or nil,
+				was_playing = class == "Sound" and desc.Playing or nil
+			}
+			effects[#effects + 1] = state
+		end
+	end
+
+	if effects then
+		effectCache[part] = effects
+	end
 end
 
-local function disable_effects(part)
-    local effects = effect_cache[part]
-    if not effects then
-        return
-    end
-    local effect_count = #effects
-    for i = 1, effect_count do
-        local state = effects[i]
-        local effect = state.effect
-        if effect and effect.Parent then
-            if effect:IsA("Sound") then
-                if effect.Playing then
-                    effect:Stop()
-                end
-            else
-                if effect:IsA("ParticleEmitter") then
-                    effect:Clear()
-                end
-                effect.Enabled = false
-            end
-        end
-    end
+local function disableEffects(part)
+	local effects = effectCache[part]
+	if not effects then
+		return
+	end
+	for i = 1, #effects do
+		local state = effects[i]
+		local effect = state.effect
+		if effect and effect.Parent then
+			if effect:IsA("Sound") then
+				if effect.Playing then
+					effect:Stop()
+				end
+			else
+				if effect:IsA("ParticleEmitter") then
+					effect:Clear()
+				end
+				effect.Enabled = false
+			end
+		end
+	end
 end
 
-local function enable_effects(part)
-    local effects = effect_cache[part]
-    if not effects then
-        return
-    end
-    local effect_count = #effects
-    for i = 1, effect_count do
-        local state = effects[i]
-        local effect = state.effect
-        if effect and effect.Parent then
-            if effect:IsA("Sound") then
-                if state.was_playing then
-                    effect:Play()
-                end
-            else
-                effect.Enabled = state.was_enabled
-            end
-        end
-    end
+local function enableEffects(part)
+	local effects = effectCache[part]
+	if not effects then
+		return
+	end
+	for i = 1, #effects do
+		local state = effects[i]
+		local effect = state.effect
+		if effect and effect.Parent then
+			if effect:IsA("Sound") then
+				if state.was_playing then
+					effect:Play()
+				end
+			else
+				if state.was_enabled ~= nil then
+					effect.Enabled = state.was_enabled
+				end
+			end
+		end
+	end
 end
 
-local function calculate_average_fps()
-    local count = #fps_samples
-    return count > 0 and (fps_sum / count) or 60
+local function calculateAverageFPS()
+	local count = #fpsSamples
+	return count > 0 and (fpsSum / count) or 60
 end
 
-local function adjust_parameters()
-    local avg_fps = calculate_average_fps()
+local function adjustParameters()
+	local avgFPS = calculateAverageFPS()
 
-    local new_cleanup = state.cleanup_distance
-    local new_objects = state.objects_per_frame
-    local new_safe_zone = state.safe_zone
-    local new_restoration_speed = stability_system.restoration_speed
+	local newCleanup = state.cleanup_distance
+	local newObjects = state.objects_per_frame
+	local newSafeZone = state.safe_zone
+	local newRestorationSpeed = stabilitySystem.restoration_speed
 
-    if avg_fps < config.super_extreme_threshold then
-        super_extreme_mode = true
-        extreme_mode = true
-        aggressive_mode = true
-        stability_system.last_aggressive_trigger = os_clock()
-        new_restoration_speed = 0
+	if avgFPS < config.super_extreme_threshold then
+		superExtremeMode = true
+		extremeMode = true
+		aggressiveMode = true
+		stabilitySystem.last_aggressive_trigger = osClock()
+		newRestorationSpeed = 0
 
-        local fps_ratio = math_max(0, math_min(1, (avg_fps - fps_ratio_min) / fps_ratio_range))
-        new_cleanup = config.ultra_extreme_distance_min +
-            (config.ultra_extreme_distance_max - config.ultra_extreme_distance_min) * fps_ratio
-        new_objects = 150
-        new_safe_zone = config.safe_zone
-    elseif avg_fps < config.extreme_mode_threshold then
-        super_extreme_mode = false
-        extreme_mode = true
-        aggressive_mode = true
-        stability_system.last_aggressive_trigger = os_clock()
-        new_restoration_speed = 0
+		local fpsRatio = fastClamp((avgFPS - fpsRatioMin) / fpsRatioRange, 0, 1)
+		newCleanup = config.ultra_extreme_distance_min + (config.ultra_extreme_distance_max - config.ultra_extreme_distance_min) * fpsRatio
+		newObjects = config.max_per_frame
+		newSafeZone = config.safe_zone
+	elseif avgFPS < config.extreme_mode_threshold then
+		superExtremeMode = false
+		extremeMode = true
+		aggressiveMode = true
+		stabilitySystem.last_aggressive_trigger = osClock()
+		newRestorationSpeed = 0
 
-        new_cleanup = 320
-        new_objects = 120
-        new_safe_zone = config.safe_zone
-    elseif avg_fps < config.aggressive_mode_threshold then
-        super_extreme_mode = false
-        extreme_mode = false
-        aggressive_mode = true
-        new_restoration_speed = 0.3
+		newCleanup = 320
+		newObjects = fastMin(config.max_per_frame, 120)
+		newSafeZone = config.safe_zone
+	elseif avgFPS < config.aggressive_mode_threshold then
+		superExtremeMode = false
+		extremeMode = false
+		aggressiveMode = true
+		newRestorationSpeed = 0.3
 
-        new_cleanup = 360
-        new_objects = 90
-        new_safe_zone = config.safe_zone
-    else
-        super_extreme_mode = false
-        extreme_mode = false
-        aggressive_mode = false
+		newCleanup = 360
+		newObjects = 90
+		newSafeZone = config.safe_zone
+	else
+		superExtremeMode = false
+		extremeMode = false
+		aggressiveMode = false
 
-        local time_since = os_clock() - stability_system.last_aggressive_trigger
-        new_restoration_speed = time_since > 5 and 1.0 or 0.6
+		local timeSince = osClock() - stabilitySystem.last_aggressive_trigger
+		newRestorationSpeed = timeSince > 5 and 1.0 or 0.6
 
-        if avg_fps > config.target_fps + 10 then
-            new_cleanup = math_min(config.max_distance, state.cleanup_distance + 35)
-            new_objects = math_min(config.max_per_frame, state.objects_per_frame + 12)
-            new_safe_zone = math_max(config.safe_zone, state.safe_zone + 5)
-        else
-            new_cleanup = math_max(config.cleanup_distance, state.cleanup_distance - 20)
-            new_objects = math_max(config.min_per_frame, state.objects_per_frame - 6)
-            new_safe_zone = math_max(config.safe_zone, state.safe_zone - 2)
-        end
-    end
+		if avgFPS > config.target_fps + 10 then
+			newCleanup = fastMin(config.max_distance, state.cleanup_distance + 35)
+			newObjects = fastMin(config.max_per_frame, state.objects_per_frame + 12)
+			newSafeZone = fastMax(config.safe_zone, state.safe_zone + 5)
+		else
+			newCleanup = fastMax(config.cleanup_distance, state.cleanup_distance - 20)
+			newObjects = fastMax(config.min_per_frame, state.objects_per_frame - 6)
+			newSafeZone = fastMax(config.safe_zone, state.safe_zone - 2)
+		end
+	end
 
-    stability_system.restoration_speed = new_restoration_speed
-    state.cleanup_distance = math_min(config.max_distance, math_max(config.cleanup_distance, new_cleanup))
-    state.objects_per_frame = math_max(config.min_per_frame, math_min(config.max_per_frame, new_objects))
-    state.safe_zone = math_max(config.safe_zone, new_safe_zone)
+	stabilitySystem.restoration_speed = newRestorationSpeed
+	state.cleanup_distance = fastClamp(newCleanup, config.cleanup_distance, config.max_distance)
+	state.objects_per_frame = fastClamp(newObjects, config.min_per_frame, config.max_per_frame)
+	state.safe_zone = fastMax(config.safe_zone, newSafeZone)
 end
 
-local function rebuild_part_list()
-    table_clear(all_parts)
-    table_clear(floor_cache)
-    table_clear(extent_cache)
+local function rebuildPartList()
+	clearTable(allParts)
+	clearTable(floorCache)
+	clearTable(extentCache)
+	clearTable(largeFloorWhitelist)
 
-    local camera = Workspace.CurrentCamera
-    local descendants = Workspace:GetDescendants()
-    local desc_count = #descendants
-    for i = 1, desc_count do
-        local obj = descendants[i]
-        if obj:IsA("BasePart")
-            and obj ~= workspace_terrain
-            and not obj:IsDescendantOf(workspace_terrain)
-            and not obj:IsDescendantOf(hidden_folder)
-            and not is_player_part(obj)
-            and not is_camera_part(obj, camera)
-            and not is_pooled_object(obj) then
-            all_parts[obj] = true
-        end
-    end
+	local camera = Workspace.CurrentCamera
+	local descendants = Workspace:GetDescendants()
+	for i = 1, #descendants do
+		trackPart(descendants[i], camera)
+	end
 end
 
 Workspace.DescendantAdded:Connect(function(obj)
-    if not obj:IsA("BasePart") then
-        return
-    end
-    if obj == workspace_terrain
-        or obj:IsDescendantOf(workspace_terrain)
-        or obj:IsDescendantOf(hidden_folder)
-        or is_player_part(obj)
-        or is_camera_part(obj, Workspace.CurrentCamera)
-        or is_pooled_object(obj) then
-        return
-    end
-    all_parts[obj] = true
-    floor_cache[obj] = nil
-    extent_cache[obj] = nil
+	if not obj:IsA("BasePart") then
+		return
+	end
+	local camera = Workspace.CurrentCamera
+	if obj == workspaceTerrain
+		or obj:IsDescendantOf(workspaceTerrain)
+		or obj:IsDescendantOf(hiddenFolder)
+		or isPlayerPart(obj)
+		or isPooledObject(obj)
+		or (camera and isCameraPart(obj, camera)) then
+		return
+	end
+	allParts[obj] = true
+	floorCache[obj] = nil
+	extentCache[obj] = nil
 end)
 
 Workspace.DescendantRemoving:Connect(function(obj)
-    if pending_hide[obj] then
-        return
-    end
-    if all_parts[obj] then
-        all_parts[obj] = nil
-        floor_cache[obj] = nil
-        extent_cache[obj] = nil
-        effect_cache[obj] = nil
-        original_parents[obj] = nil
-    end
+	if pendingHide[obj] then
+		return
+	end
+	if allParts[obj] or largeFloorWhitelist[obj] or effectCache[obj] then
+		cleanupTracking(obj)
+	end
 end)
 
-hidden_folder.DescendantRemoving:Connect(function(obj)
-    all_parts[obj] = nil
-    floor_cache[obj] = nil
-    extent_cache[obj] = nil
-    effect_cache[obj] = nil
-    original_parents[obj] = nil
-    pending_hide[obj] = nil
+hiddenFolder.DescendantRemoving:Connect(function(obj)
+	cleanupTracking(obj)
 end)
 
-task.spawn(rebuild_part_list)
+task.spawn(rebuildPartList)
 
 task.spawn(function()
-    while true do
-        task.wait(config.adjustment_interval)
-        adjust_parameters()
-    end
+	while task.wait(config.adjustment_interval) do
+		adjustParameters()
+	end
 end)
 
-local hide_index = 1
-local restore_index = 1
+local hideIndex = 1
+local restoreIndex = 1
 
 task.spawn(function()
-    while true do
-        task.wait(config.scan_interval)
-        if not refresh_character_reference() then
-            continue
-        end
+	while task.wait(config.scan_interval) do
+		if not refreshCharacterReference() then
+			for i = 1, partsToHideLen do
+				partsToHide[i] = nil
+			end
+			partsToHideLen = 0
+			hideIndex = 1
+			continue
+		end
 
-        local root = humanoid_root_part
-        local player_pos = root.Position
-        local px, py, pz = player_pos.X, player_pos.Y, player_pos.Z
+		local root = humanoidRootPart
+		local playerPos = root.Position
+		local px, py, pz = playerPos.X, playerPos.Y, playerPos.Z
 
-        table_clear(parts_to_hide)
-        hide_index = 1
+		for i = 1, partsToHideLen do
+			partsToHide[i] = nil
+		end
+		partsToHideLen = 0
+		hideIndex = 1
 
-        local camera = Workspace.CurrentCamera
-        local cleanup_radius = state.cleanup_distance
-        local safe_zone_radius = state.safe_zone
+		local camera = Workspace.CurrentCamera
+		local cleanupRadius = state.cleanup_distance
+		local safeZoneRadius = state.safe_zone
 
-        local hide_count = 0
-        for part in all_parts do
-            local parent = part.Parent
-            if not parent or parent == hidden_folder then
-                continue
-            end
-            if is_large_floor(part) then
-                continue
-            end
-            if is_pooled_object(part) then
-                continue
-            end
+		partsToEvictLen = 0
 
-            local obj_pos = part.Position
-            local dx = obj_pos.X - px
-            local dy = obj_pos.Y - py
-            local dz = obj_pos.Z - pz
-            local dist_sq = dx * dx + dy * dy + dz * dz
+		for part in pairs(allParts) do
+			if not part or not part.Parent or part.Parent == hiddenFolder then
+				partsToEvictLen += 1
+				partsToEvict[partsToEvictLen] = part
+				continue
+			end
+			if largeFloorWhitelist[part] or isLargeFloor(part) then
+				continue
+			end
+			if isPooledObject(part)
+				or isPlayerPart(part)
+				or (camera and isCameraPart(part, camera)) then
+				continue
+			end
 
-            local bounding_radius = get_bounding_radius(part)
-            local removal_limit = cleanup_radius + bounding_radius
-            if dist_sq <= removal_limit * removal_limit then
-                continue
-            end
+			local objPos = part.Position
+			local dx = objPos.X - px
+			local dy = objPos.Y - py
+			local dz = objPos.Z - pz
+			local distSq = dx * dx + dy * dy + dz * dz
 
-            if is_player_part(part) or is_camera_part(part, camera) then
-                continue
-            end
+			local boundingRadius = getBoundingRadius(part)
+			local removalLimit = cleanupRadius + boundingRadius
+			if distSq <= removalLimit * removalLimit then
+				continue
+			end
 
-            local horizontal_sq = dx * dx + dz * dz
-            local expanded_safe = safe_zone_radius + bounding_radius
-            local expanded_safe_sq = expanded_safe * expanded_safe
-            local should_hide = true
+			local horizontalSq = dx * dx + dz * dz
+			local expandedSafe = safeZoneRadius + boundingRadius
+			local expandedSafeSq = expandedSafe * expandedSafe
+			local shouldHide = true
 
-            if not super_extreme_mode then
-                if horizontal_sq <= expanded_safe_sq then
-                    should_hide = false
-                else
-                    local dy_sq = dy * dy
-                    local vertical_limit = vertical_check_threshold + bounding_radius
-                    if dy_sq < vertical_limit * vertical_limit then
-                        if horizontal_sq <= expanded_safe_sq * safe_zone_multiplier then
-                            should_hide = false
-                        end
-                    end
-                end
-            else
-                local tight_radius = tight_radius_base + bounding_radius
-                if horizontal_sq < tight_radius * tight_radius then
-                    should_hide = false
-                end
-            end
+			if not superExtremeMode then
+				if horizontalSq <= expandedSafeSq then
+					shouldHide = false
+				else
+					local dySq = dy * dy
+					local verticalLimit = verticalCheckThreshold + boundingRadius
+					if dySq < verticalLimit * verticalLimit then
+						if horizontalSq <= expandedSafeSq * safeZoneMultiplier then
+							shouldHide = false
+						end
+					end
+				end
+			else
+				local tightRadius = tightRadiusBase + boundingRadius
+				if horizontalSq < tightRadius * tightRadius then
+					shouldHide = false
+				end
+			end
 
-            if should_hide then
-                hide_count = hide_count + 1
-                parts_to_hide[hide_count] = part
-            end
-        end
-    end
+			if shouldHide then
+				partsToHideLen += 1
+				partsToHide[partsToHideLen] = part
+			end
+		end
+
+		for i = 1, partsToEvictLen do
+			local part = partsToEvict[i]
+			allParts[part] = nil
+			partsToEvict[i] = nil
+		end
+	end
 end)
 
 task.spawn(function()
-    while true do
-        task.wait(config.scan_interval + 0.15)
-        if stability_system.restoration_speed == 0 then
-            continue
-        end
-        if not refresh_character_reference() then
-            continue
-        end
+	while task.wait(config.scan_interval + 0.15) do
+		if stabilitySystem.restoration_speed == 0 or not refreshCharacterReference() then
+			for i = 1, partsToRestoreLen do
+				partsToRestore[i] = nil
+			end
+			partsToRestoreLen = 0
+			restoreIndex = 1
+			continue
+		end
 
-        local root = humanoid_root_part
-        local player_pos = root.Position
-        local px, py, pz = player_pos.X, player_pos.Y, player_pos.Z
+		local root = humanoidRootPart
+		local playerPos = root.Position
+		local px, py, pz = playerPos.X, playerPos.Y, playerPos.Z
 
-        table_clear(parts_to_restore)
-        restore_index = 1
+		for i = 1, partsToRestoreLen do
+			partsToRestore[i] = nil
+		end
+		partsToRestoreLen = 0
+		restoreIndex = 1
 
-        local restore_radius = state.cleanup_distance * config.restore_multiplier
+		local restoreRadius = state.cleanup_distance * config.restore_multiplier
 
-        local children = hidden_folder:GetChildren()
-        local child_count = #children
-        local restore_count = 0
-        for i = 1, child_count do
-            local obj = children[i]
-            if obj:IsA("BasePart") then
-                local obj_pos = obj.Position
-                local dx = obj_pos.X - px
-                local dy = obj_pos.Y - py
-                local dz = obj_pos.Z - pz
-                local dist_sq = dx * dx + dy * dy + dz * dz
+		local children = hiddenFolder:GetChildren()
+		for i = 1, #children do
+			local obj = children[i]
+			if obj:IsA("BasePart") and not pendingHide[obj] then
+				local objPos = obj.Position
+				local dx = objPos.X - px
+				local dy = objPos.Y - py
+				local dz = objPos.Z - pz
+				local distSq = dx * dx + dy * dy + dz * dz
 
-                local bounding_radius = get_bounding_radius(obj)
-                local limit = restore_radius + bounding_radius
-                if dist_sq <= limit * limit then
-                    restore_count = restore_count + 1
-                    parts_to_restore[restore_count] = obj
-                end
-            end
-        end
-    end
+				local boundingRadius = getBoundingRadius(obj)
+				local limit = restoreRadius + boundingRadius
+				if distSq <= limit * limit then
+					partsToRestoreLen += 1
+					partsToRestore[partsToRestoreLen] = obj
+				end
+			end
+		end
+	end
 end)
 
 RunService.Heartbeat:Connect(function(deltaTime)
-    local old_fps = fps_samples[fps_index]
-    local new_fps = deltaTime > 0.001 and (1 / deltaTime) or 60
-    fps_samples[fps_index] = new_fps
-    fps_sum = fps_sum - old_fps + new_fps
-    fps_index = fps_index % config.fps_sample_count + 1
+	local oldFPS = fpsSamples[fpsIndex]
+	local newFPS = deltaTime > 0.001 and (1 / deltaTime) or 60
+	fpsSamples[fpsIndex] = newFPS
+	fpsSum = fpsSum - oldFPS + newFPS
+	fpsIndex = fpsIndex % config.fps_sample_count + 1
 
-    local effective_per_frame = super_extreme_mode and state.objects_per_frame * 3
-        or extreme_mode and math_floor(state.objects_per_frame * 2.5)
-        or aggressive_mode and math_floor(state.objects_per_frame * 1.35)
-        or state.objects_per_frame
+	local baseObjectsPerFrame = state.objects_per_frame
+	local effectivePerFrame = superExtremeMode and baseObjectsPerFrame * 3
+		or extremeMode and fastFloor(baseObjectsPerFrame * 2.5)
+		or aggressiveMode and fastFloor(baseObjectsPerFrame * 1.35)
+		or baseObjectsPerFrame
 
-    local parts_to_hide_count = #parts_to_hide
-    local processed_hide = 0
-    local camera = Workspace.CurrentCamera
+	local camera = Workspace.CurrentCamera
 
-    while processed_hide < effective_per_frame and hide_index <= parts_to_hide_count do
-        local obj = parts_to_hide[hide_index]
-        if obj and obj.Parent and obj.Parent ~= hidden_folder and not is_player_part(obj) and not is_camera_part(obj, camera) and not is_pooled_object(obj) then
-            pending_hide[obj] = true
-            local success = pcall(function()
-                scan_effects_immediate(obj)
-                disable_effects(obj)
-                if original_parents[obj] == nil then
-                    original_parents[obj] = obj.Parent
-                end
-                obj.Parent = hidden_folder
-            end)
-            pending_hide[obj] = nil
+	local processedHide = 0
+	while processedHide < effectivePerFrame and hideIndex <= partsToHideLen do
+		local obj = partsToHide[hideIndex]
+		if obj and obj.Parent and obj.Parent ~= hiddenFolder
+			and not isPlayerPart(obj)
+			and not (camera and isCameraPart(obj, camera))
+			and not isPooledObject(obj) then
 
-            if success then
-                all_parts[obj] = nil
-            else
-                all_parts[obj] = nil
-                original_parents[obj] = nil
-                floor_cache[obj] = nil
-                extent_cache[obj] = nil
-                effect_cache[obj] = nil
-            end
-        end
-        hide_index = hide_index + 1
-        processed_hide = processed_hide + 1
-    end
+			pendingHide[obj] = true
+			local success = pcall(function()
+				if not effectCache[obj] then
+					scanEffectsImmediate(obj)
+				end
+				disableEffects(obj)
+				if originalParents[obj] == nil then
+					originalParents[obj] = obj.Parent
+				end
+				obj.Parent = hiddenFolder
+			end)
+			pendingHide[obj] = nil
 
-    if hide_index > parts_to_hide_count then
-        hide_index = 1
-    end
+			if success then
+				allParts[obj] = nil
+			else
+				cleanupTracking(obj)
+			end
+		end
+		hideIndex += 1
+		processedHide += 1
+	end
 
-    if stability_system.restoration_speed > 0 then
-        local parts_to_restore_count = #parts_to_restore
-        if parts_to_restore_count > 0 then
-            local adjusted_per_frame = math_floor(state.objects_per_frame * stability_system.restoration_speed)
-            local min_restore = math_max(config.min_per_frame, adjusted_per_frame)
-            local processed_restore = 0
+	if hideIndex > partsToHideLen then
+		hideIndex = 1
+	end
 
-            while processed_restore < min_restore and restore_index <= parts_to_restore_count do
-                local obj = parts_to_restore[restore_index]
-                if obj then
-                    local parent = original_parents[obj]
-                    if parent and parent.Parent then
-                        local success = pcall(function()
-                            obj.Parent = parent
-                            enable_effects(obj)
-                        end)
-                        if success then
-                            original_parents[obj] = nil
-                            all_parts[obj] = true
-                            floor_cache[obj] = nil
-                            extent_cache[obj] = nil
-                        else
-                            original_parents[obj] = nil
-                        end
-                    else
-                        original_parents[obj] = nil
-                    end
-                end
-                restore_index = restore_index + 1
-                processed_restore = processed_restore + 1
-            end
+	if stabilitySystem.restoration_speed > 0 and partsToRestoreLen > 0 then
+		local adjustedPerFrame = fastFloor(state.objects_per_frame * stabilitySystem.restoration_speed)
+		local minRestore = fastMax(config.min_per_frame, adjustedPerFrame)
+		local processedRestore = 0
 
-            if restore_index > parts_to_restore_count then
-                restore_index = 1
-            end
-        end
-    end
+		while processedRestore < minRestore and restoreIndex <= partsToRestoreLen do
+			local obj = partsToRestore[restoreIndex]
+			if obj then
+				local parent = originalParents[obj]
+				if parent and parent.Parent then
+					local success = pcall(function()
+						obj.Parent = parent
+						enableEffects(obj)
+					end)
+					if success then
+						originalParents[obj] = nil
+						allParts[obj] = true
+						floorCache[obj] = nil
+						extentCache[obj] = nil
+						largeFloorWhitelist[obj] = nil
+					else
+						originalParents[obj] = nil
+					end
+				else
+					originalParents[obj] = nil
+				end
+			end
+			restoreIndex += 1
+			processedRestore += 1
+		end
+
+		if restoreIndex > partsToRestoreLen then
+			restoreIndex = 1
+		end
+	end
 end)
