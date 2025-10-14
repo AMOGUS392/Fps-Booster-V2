@@ -34,7 +34,9 @@ local config = {
 	ultra_extreme_distance_max = 100,
 	restore_multiplier = 0.75,
 	floor_min_area = 500,
-	floor_max_height = 8
+	floor_max_height = 8,
+	hide_scan_batch = 400,
+	restore_scan_batch = 200
 }
 
 local state = {
@@ -57,20 +59,24 @@ end
 
 local originalParents = {}
 local pendingHide = {}
+
 local allParts = {}
+local allPartsCount = 0
 local partsToHide = table.create(1024)
 local partsToRestore = table.create(512)
-local largeFloorWhitelist = {}
-local partsToEvict = table.create(128)
-
 local partsToHideLen = 0
 local partsToRestoreLen = 0
-local partsToEvictLen = 0
+
+local hiddenParts = table.create(512)
+local hiddenLookup = {}
+local hiddenCount = 0
+local restoringNow = {}
 
 local playerCharacters = {}
 local floorCache = {}
 local effectCache = setmetatable({}, { __mode = "k" })
 local extentCache = {}
+local largeFloorWhitelist = {}
 
 local fpsSamples = table.create(config.fps_sample_count, config.target_fps)
 local fpsIndex = 1
@@ -87,6 +93,43 @@ local safeZoneMultiplier = 1.69
 local tightRadiusBase = 30
 local fpsRatioMin = 5
 local fpsRatioRange = 10
+
+local hideIndex = 1
+local restoreIndex = 1
+local scanCursor = nil
+local hiddenScanIndex = 1
+
+local hideBufferVersion = 0
+local activeHideVersion = 0
+local restoreBufferVersion = 0
+local activeRestoreVersion = 0
+
+local function addHiddenPart(part)
+	if hiddenLookup[part] then
+		return
+	end
+	hiddenCount += 1
+	hiddenParts[hiddenCount] = part
+	hiddenLookup[part] = hiddenCount
+end
+
+local function removeHiddenPart(part)
+	local index = hiddenLookup[part]
+	if not index then
+		return
+	end
+	local last = hiddenParts[hiddenCount]
+	hiddenParts[index] = last
+	if last then
+		hiddenLookup[last] = index
+	end
+	hiddenParts[hiddenCount] = nil
+	hiddenLookup[part] = nil
+	hiddenCount -= 1
+	if hiddenCount < hiddenScanIndex then
+		hiddenScanIndex = hiddenCount > 0 and hiddenCount or 1
+	end
+end
 
 local function refreshCharacterReference()
 	if not character or not character.Parent then
@@ -121,97 +164,39 @@ local function isPlayerPart(part)
 	return false
 end
 
+local function deregisterPart(part)
+	if allParts[part] then
+		allParts[part] = nil
+		allPartsCount -= 1
+		if allPartsCount < 0 then
+			allPartsCount = 0
+		end
+		if scanCursor == part then
+			scanCursor = nil
+		end
+	end
+end
+
 local function cleanupTracking(part)
-	allParts[part] = nil
+	deregisterPart(part)
 	floorCache[part] = nil
 	extentCache[part] = nil
 	largeFloorWhitelist[part] = nil
 	originalParents[part] = nil
 	effectCache[part] = nil
 	pendingHide[part] = nil
+	removeHiddenPart(part)
 end
-
-local function trackPart(part, camera)
-	if not part:IsA("BasePart") then
-		return
-	end
-	if part == workspaceTerrain
-		or part:IsDescendantOf(workspaceTerrain)
-		or part:IsDescendantOf(hiddenFolder)
-		or isPlayerPart(part)
-		or isPooledObject(part)
-		or (camera and isCameraPart(part, camera)) then
-		return
-	end
-	allParts[part] = true
-	floorCache[part] = nil
-	extentCache[part] = nil
-end
-
-local function detachCharacterParts(characterModel)
-	local descendants = characterModel:GetDescendants()
-	for i = 1, #descendants do
-		local desc = descendants[i]
-		if desc:IsA("BasePart") then
-			cleanupTracking(desc)
-		end
-	end
-end
-
-local function updatePlayerCharacters()
-	clearTable(playerCharacters)
-
-	local playersList = Players:GetPlayers()
-	for i = 1, #playersList do
-		local plr = playersList[i]
-		local char = plr.Character
-		if char then
-			playerCharacters[char] = true
-			detachCharacterParts(char)
-		end
-	end
-end
-
-player.CharacterAdded:Connect(function(char)
-	character = char
-	humanoidRootPart = char:WaitForChild("HumanoidRootPart")
-	updatePlayerCharacters()
-end)
-
-player.CharacterRemoving:Connect(function()
-	humanoidRootPart = nil
-end)
-
-Players.PlayerAdded:Connect(function(plr)
-	plr.CharacterAdded:Connect(function()
-		updatePlayerCharacters()
-	end)
-	plr.CharacterRemoving:Connect(function(char)
-		if char then
-			detachCharacterParts(char)
-		end
-	end)
-end)
-
-Players.PlayerRemoving:Connect(function(plr)
-	local char = plr.Character
-	if char then
-		detachCharacterParts(char)
-	end
-	updatePlayerCharacters()
-end)
-
-updatePlayerCharacters()
-refreshCharacterReference()
 
 local function isLargeFloor(part)
 	local cached = floorCache[part]
 	if cached ~= nil then
 		return cached
-	 end
+	end
 	local size = part.Size
 	if size.Y > config.floor_max_height then
 		floorCache[part] = false
+		largeFloorWhitelist[part] = nil
 		return false
 	end
 	local horizontalArea = size.X * size.Z
@@ -219,7 +204,9 @@ local function isLargeFloor(part)
 	floorCache[part] = isFloor
 	if isFloor then
 		largeFloorWhitelist[part] = true
-	end
+	else
+		largeFloorWhitelist[part] = nil
+	 end
 	return isFloor
 end
 
@@ -237,17 +224,34 @@ local function getBoundingRadius(part)
 	return radius
 end
 
+local function registerPart(part, camera)
+	if not part:IsA("BasePart") then
+		return
+	end
+	if allParts[part]
+		or part == workspaceTerrain
+		or part:IsDescendantOf(workspaceTerrain)
+		or part:IsDescendantOf(hiddenFolder)
+		or isPlayerPart(part)
+		or isPooledObject(part)
+		or (camera and isCameraPart(part, camera)) then
+		return
+	end
+	allParts[part] = true
+	allPartsCount += 1
+	floorCache[part] = nil
+	extentCache[part] = nil
+end
+
 local function scanEffectsImmediate(part)
 	if effectCache[part] then
 		return
 	end
-
-	local effects = nil
+	local effects
 	local descendants = part:GetDescendants()
 	for i = 1, #descendants do
 		local desc = descendants[i]
 		local class = desc.ClassName
-
 		if class == "ParticleEmitter"
 			or class == "PointLight"
 			or class == "SpotLight"
@@ -257,15 +261,13 @@ local function scanEffectsImmediate(part)
 			or class == "Sparkles" then
 
 			effects = effects or table.create(6)
-			local state = {
+			effects[#effects + 1] = {
 				effect = desc,
 				was_enabled = class ~= "Sound" and desc.Enabled or nil,
 				was_playing = class == "Sound" and desc.Playing or nil
 			}
-			effects[#effects + 1] = state
 		end
 	end
-
 	if effects then
 		effectCache[part] = effects
 	end
@@ -384,49 +386,114 @@ local function adjustParameters()
 	state.safe_zone = fastMax(config.safe_zone, newSafeZone)
 end
 
+local function detachCharacterParts(characterModel)
+	local descendants = characterModel:GetDescendants()
+	for i = 1, #descendants do
+		local desc = descendants[i]
+		if desc:IsA("BasePart") then
+			cleanupTracking(desc)
+		end
+	end
+end
+
+local function updatePlayerCharacters()
+	clearTable(playerCharacters)
+	local playersList = Players:GetPlayers()
+	for i = 1, #playersList do
+		local plr = playersList[i]
+		local char = plr.Character
+		if char then
+			playerCharacters[char] = true
+			detachCharacterParts(char)
+		end
+	end
+end
+
+player.CharacterAdded:Connect(function(char)
+	character = char
+	humanoidRootPart = char:WaitForChild("HumanoidRootPart")
+	updatePlayerCharacters()
+end)
+
+player.CharacterRemoving:Connect(function()
+	humanoidRootPart = nil
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	plr.CharacterAdded:Connect(function()
+		updatePlayerCharacters()
+	end)
+	plr.CharacterRemoving:Connect(function(char)
+		if char then
+			detachCharacterParts(char)
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	local char = plr.Character
+	if char then
+		detachCharacterParts(char)
+	end
+	updatePlayerCharacters()
+end)
+
+updatePlayerCharacters()
+refreshCharacterReference()
+
 local function rebuildPartList()
 	clearTable(allParts)
+	allPartsCount = 0
 	clearTable(floorCache)
 	clearTable(extentCache)
 	clearTable(largeFloorWhitelist)
+	scanCursor = nil
+	hiddenScanIndex = 1
 
 	local camera = Workspace.CurrentCamera
 	local descendants = Workspace:GetDescendants()
 	for i = 1, #descendants do
-		trackPart(descendants[i], camera)
+		registerPart(descendants[i], camera)
 	end
 end
 
 Workspace.DescendantAdded:Connect(function(obj)
-	if not obj:IsA("BasePart") then
-		return
+	if obj:IsA("BasePart") then
+		registerPart(obj, Workspace.CurrentCamera)
 	end
-	local camera = Workspace.CurrentCamera
-	if obj == workspaceTerrain
-		or obj:IsDescendantOf(workspaceTerrain)
-		or obj:IsDescendantOf(hiddenFolder)
-		or isPlayerPart(obj)
-		or isPooledObject(obj)
-		or (camera and isCameraPart(obj, camera)) then
-		return
-	end
-	allParts[obj] = true
-	floorCache[obj] = nil
-	extentCache[obj] = nil
 end)
 
 Workspace.DescendantRemoving:Connect(function(obj)
 	if pendingHide[obj] then
 		return
 	end
-	if allParts[obj] or largeFloorWhitelist[obj] or effectCache[obj] then
+	if obj:IsA("BasePart") then
 		cleanupTracking(obj)
 	end
 end)
 
-hiddenFolder.DescendantRemoving:Connect(function(obj)
-	cleanupTracking(obj)
+hiddenFolder.ChildAdded:Connect(function(obj)
+	if obj:IsA("BasePart") then
+		addHiddenPart(obj)
+	end
 end)
+
+hiddenFolder.DescendantRemoving:Connect(function(obj)
+	removeHiddenPart(obj)
+	if restoringNow[obj] then
+		restoringNow[obj] = nil
+		return
+	end
+	if obj:IsA("BasePart") then
+		cleanupTracking(obj)
+	end
+end)
+
+for _, child in ipairs(hiddenFolder:GetChildren()) do
+	if child:IsA("BasePart") then
+		addHiddenPart(child)
+	end
+end
 
 task.spawn(rebuildPartList)
 
@@ -436,46 +503,49 @@ task.spawn(function()
 	end
 end)
 
-local hideIndex = 1
-local restoreIndex = 1
-
 task.spawn(function()
+	local batch = config.hide_scan_batch
 	while task.wait(config.scan_interval) do
 		if not refreshCharacterReference() then
-			for i = 1, partsToHideLen do
-				partsToHide[i] = nil
-			end
+			hideBufferVersion += 1
+			clearTable(partsToHide)
 			partsToHideLen = 0
 			hideIndex = 1
+			activeHideVersion = hideBufferVersion
 			continue
 		end
+
+		hideBufferVersion += 1
+		local currentVersion = hideBufferVersion
+		clearTable(partsToHide)
+		partsToHideLen = 0
+		hideIndex = 1
 
 		local root = humanoidRootPart
 		local playerPos = root.Position
 		local px, py, pz = playerPos.X, playerPos.Y, playerPos.Z
 
-		for i = 1, partsToHideLen do
-			partsToHide[i] = nil
-		end
-		partsToHideLen = 0
-		hideIndex = 1
-
 		local camera = Workspace.CurrentCamera
 		local cleanupRadius = state.cleanup_distance
 		local safeZoneRadius = state.safe_zone
 
-		partsToEvictLen = 0
+		local processed = 0
+		while processed < batch and allPartsCount > 0 do
+			local part = next(allParts, scanCursor)
+			if not part then
+				scanCursor = nil
+				break
+			end
+			scanCursor = part
+			processed += 1
 
-		for part in pairs(allParts) do
-			if not part or not part.Parent or part.Parent == hiddenFolder then
-				partsToEvictLen += 1
-				partsToEvict[partsToEvictLen] = part
+			if not part.Parent or part.Parent == hiddenFolder then
+				cleanupTracking(part)
 				continue
 			end
-			if largeFloorWhitelist[part] or isLargeFloor(part) then
-				continue
-			end
-			if isPooledObject(part)
+			if largeFloorWhitelist[part]
+				or isLargeFloor(part)
+				or isPooledObject(part)
 				or isPlayerPart(part)
 				or (camera and isCameraPart(part, camera)) then
 				continue
@@ -523,41 +593,50 @@ task.spawn(function()
 			end
 		end
 
-		for i = 1, partsToEvictLen do
-			local part = partsToEvict[i]
-			allParts[part] = nil
-			partsToEvict[i] = nil
-		end
+		activeHideVersion = currentVersion
 	end
 end)
 
 task.spawn(function()
+	local batch = config.restore_scan_batch
 	while task.wait(config.scan_interval + 0.15) do
 		if stabilitySystem.restoration_speed == 0 or not refreshCharacterReference() then
-			for i = 1, partsToRestoreLen do
-				partsToRestore[i] = nil
-			end
+			restoreBufferVersion += 1
+			clearTable(partsToRestore)
 			partsToRestoreLen = 0
 			restoreIndex = 1
+			activeRestoreVersion = restoreBufferVersion
 			continue
 		end
+
+		restoreBufferVersion += 1
+		local currentVersion = restoreBufferVersion
+		clearTable(partsToRestore)
+		partsToRestoreLen = 0
+		restoreIndex = 1
 
 		local root = humanoidRootPart
 		local playerPos = root.Position
 		local px, py, pz = playerPos.X, playerPos.Y, playerPos.Z
-
-		for i = 1, partsToRestoreLen do
-			partsToRestore[i] = nil
-		end
-		partsToRestoreLen = 0
-		restoreIndex = 1
-
 		local restoreRadius = state.cleanup_distance * config.restore_multiplier
 
-		local children = hiddenFolder:GetChildren()
-		for i = 1, #children do
-			local obj = children[i]
-			if obj:IsA("BasePart") and not pendingHide[obj] then
+		if hiddenCount > 0 then
+			local processed = 0
+			while processed < batch and hiddenCount > 0 do
+				if hiddenScanIndex > hiddenCount then
+					hiddenScanIndex = 1
+				end
+				local obj = hiddenParts[hiddenScanIndex]
+				hiddenScanIndex += 1
+				processed += 1
+
+				if not obj or obj.Parent ~= hiddenFolder or pendingHide[obj] then
+					if obj then
+						removeHiddenPart(obj)
+					end
+					continue
+				end
+
 				local objPos = obj.Position
 				local dx = objPos.X - px
 				local dy = objPos.Y - py
@@ -572,6 +651,8 @@ task.spawn(function()
 				end
 			end
 		end
+
+		activeRestoreVersion = currentVersion
 	end
 end)
 
@@ -590,8 +671,11 @@ RunService.Heartbeat:Connect(function(deltaTime)
 
 	local camera = Workspace.CurrentCamera
 
+	local hideCountSnapshot = partsToHideLen
+	local hideVersionSnapshot = activeHideVersion
 	local processedHide = 0
-	while processedHide < effectivePerFrame and hideIndex <= partsToHideLen do
+
+	while processedHide < effectivePerFrame and hideIndex <= hideCountSnapshot do
 		local obj = partsToHide[hideIndex]
 		if obj and obj.Parent and obj.Parent ~= hiddenFolder
 			and not isPlayerPart(obj)
@@ -612,52 +696,72 @@ RunService.Heartbeat:Connect(function(deltaTime)
 			pendingHide[obj] = nil
 
 			if success then
-				allParts[obj] = nil
+				deregisterPart(obj)
+				addHiddenPart(obj)
 			else
 				cleanupTracking(obj)
 			end
 		end
+		partsToHide[hideIndex] = nil
 		hideIndex += 1
 		processedHide += 1
 	end
 
-	if hideIndex > partsToHideLen then
+	if hideIndex > hideCountSnapshot then
 		hideIndex = 1
+		if activeHideVersion == hideVersionSnapshot then
+			partsToHideLen = 0
+			clearTable(partsToHide)
+		end
 	end
 
-	if stabilitySystem.restoration_speed > 0 and partsToRestoreLen > 0 then
-		local adjustedPerFrame = fastFloor(state.objects_per_frame * stabilitySystem.restoration_speed)
-		local minRestore = fastMax(config.min_per_frame, adjustedPerFrame)
-		local processedRestore = 0
+	if stabilitySystem.restoration_speed > 0 then
+		local restoreCountSnapshot = partsToRestoreLen
+		if restoreCountSnapshot > 0 then
+			local restoreVersionSnapshot = activeRestoreVersion
+			local adjustedPerFrame = fastFloor(state.objects_per_frame * stabilitySystem.restoration_speed)
+			local minRestore = fastMax(config.min_per_frame, adjustedPerFrame)
+			local processedRestore = 0
 
-		while processedRestore < minRestore and restoreIndex <= partsToRestoreLen do
-			local obj = partsToRestore[restoreIndex]
-			if obj then
-				local parent = originalParents[obj]
-				if parent and parent.Parent then
-					local success = pcall(function()
-						obj.Parent = parent
-						enableEffects(obj)
-					end)
-					if success then
-						originalParents[obj] = nil
-						allParts[obj] = true
-						floorCache[obj] = nil
-						extentCache[obj] = nil
-						largeFloorWhitelist[obj] = nil
+			while processedRestore < minRestore and restoreIndex <= restoreCountSnapshot do
+				local obj = partsToRestore[restoreIndex]
+				if obj and obj.Parent == hiddenFolder then
+					local parent = originalParents[obj]
+					if parent and parent.Parent then
+						restoringNow[obj] = true
+						local success = pcall(function()
+							obj.Parent = parent
+							enableEffects(obj)
+						end)
+						restoringNow[obj] = nil
+
+						if success then
+							originalParents[obj] = nil
+							removeHiddenPart(obj)
+							registerPart(obj, camera)
+						else
+							originalParents[obj] = nil
+							removeHiddenPart(obj)
+							cleanupTracking(obj)
+						end
 					else
 						originalParents[obj] = nil
+						removeHiddenPart(obj)
+						cleanupTracking(obj)
 					end
-				else
-					originalParents[obj] = nil
+				end
+				partsToRestore[restoreIndex] = nil
+				restoreIndex += 1
+				processedRestore += 1
+			end
+
+			if restoreIndex > restoreCountSnapshot then
+				restoreIndex = 1
+				if activeRestoreVersion == restoreVersionSnapshot then
+					partsToRestoreLen = 0
+					clearTable(partsToRestore)
 				end
 			end
-			restoreIndex += 1
-			processedRestore += 1
-		end
-
-		if restoreIndex > partsToRestoreLen then
-			restoreIndex = 1
 		end
 	end
 end)
