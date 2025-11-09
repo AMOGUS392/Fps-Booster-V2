@@ -19,7 +19,6 @@ hiddenFolder.Name = "HiddenObjects_LOD"
 
 local parts = {}
 local partsCount = 0
-local scanIndex = 1
 
 local hiddenParts = {}
 
@@ -38,11 +37,9 @@ local lastPlayerPos = hrp and hrp.Position or Vector3.zero
 
 local running = true
 local lastScan = 0
+local deferredCount = 0
 
 local sqrt = math.sqrt
-local overlapParams = OverlapParams.new()
-overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-overlapParams.MaxParts = 1000
 
 local function shouldSkip(part)
 	if not part:IsA("BasePart") then return true end
@@ -73,29 +70,53 @@ local function getRadiusSq(sx, sy, sz)
 	return hx * hx + hy * hy + hz * hz
 end
 
-local function disableEffects(part)
+local function scanEffects(part)
+	local effects = {}
+	local count = 0
+	
 	for _, child in part:GetDescendants() do
 		local className = child.ClassName
-		if child.Enabled then
-			if className == "ParticleEmitter" or className == "Trail" then
-				child:Clear()
-				child.Enabled = false
-				child:SetAttribute("_WasEnabled", true)
-			elseif className == "Beam" or className == "PointLight" or className == "SpotLight" 
-				or className == "SurfaceLight" or className == "Fire" or className == "Smoke" 
-				or className == "Sparkles" then
-				child.Enabled = false
-				child:SetAttribute("_WasEnabled", true)
+		if className == "ParticleEmitter" or className == "Trail" then
+			if child.Enabled then
+				count += 1
+				effects[count] = {obj = child, needsClear = true}
 			end
+		elseif className == "Beam" or className == "PointLight" or className == "SpotLight" 
+			or className == "SurfaceLight" or className == "Fire" or className == "Smoke" 
+			or className == "Sparkles" then
+			if child.Enabled then
+				count += 1
+				effects[count] = {obj = child, needsClear = false}
+			end
+		end
+	end
+	
+	return count > 0 and effects or nil
+end
+
+local function disableEffects(effects)
+	if not effects then return end
+	
+	for i = 1, #effects do
+		local data = effects[i]
+		local obj = data.obj
+		if obj and obj.Parent then
+			if data.needsClear then
+				obj:Clear()
+			end
+			obj.Enabled = false
 		end
 	end
 end
 
-local function enableEffects(part)
-	for _, child in part:GetDescendants() do
-		if child:GetAttribute("_WasEnabled") then
-			child.Enabled = true
-			child:SetAttribute("_WasEnabled", nil)
+local function enableEffects(effects)
+	if not effects then return end
+	
+	for i = 1, #effects do
+		local data = effects[i]
+		local obj = data.obj
+		if obj and obj.Parent then
+			obj.Enabled = true
 		end
 	end
 end
@@ -111,7 +132,8 @@ local function addToParts(part)
 		parent = part.Parent,
 		hidden = false,
 		radiusSq = getRadiusSq(sx, sy, sz),
-		isFloor = isFloor(sx, sy, sz)
+		isFloor = isFloor(sx, sy, sz),
+		effects = scanEffects(part)
 	}
 end
 
@@ -207,28 +229,35 @@ connections.descAdded = Workspace.DescendantAdded:Connect(registerPart)
 connections.descRemoving = Workspace.DescendantRemoving:Connect(cleanupPart)
 
 task.spawn(function()
-	for _, desc in Workspace:GetDescendants() do
-		registerPart(desc)
+	local descendants = Workspace:GetDescendants()
+	local count = #descendants
+	for i = 1, count do
+		registerPart(descendants[i])
+		if i % 50 == 0 then
+			task.wait()
+		end
 	end
 end)
 
 local function scanNearby()
 	if not hrp then return end
 	
-	table.clear(toHide)
-	table.clear(toRestore)
 	hideLen = 0
 	restoreLen = 0
 	
 	local pos = hrp.Position
 	local px, py, pz = pos.X, pos.Y, pos.Z
 	
+	local size = Vector3.new(640, 640, 640)
+	local cframe = CFrame.new(pos)
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
 	overlapParams.FilterDescendantsInstances = {character}
-	for _, char in playerChars do
+	for char in playerChars do
 		table.insert(overlapParams.FilterDescendantsInstances, char)
 	end
 	
-	local nearbyParts = Workspace:GetPartBoundsInRadius(pos, 320)
+	local nearbyParts = Workspace:GetPartBoundsInBox(cframe, size, overlapParams)
 	
 	for _, part in nearbyParts do
 		if part.Parent and part.Parent ~= hiddenFolder then
@@ -281,9 +310,11 @@ local hideIndex = 1
 local restoreIndex = 1
 
 local function processBatch()
+	if deferredCount >= 8 then return end
+	
 	local processed = 0
 	
-	while processed < 5 and hideIndex <= hideLen do
+	while processed < 2 and hideIndex <= hideLen and deferredCount < 8 do
 		local part = toHide[hideIndex]
 		
 		if part then
@@ -292,15 +323,17 @@ local function processBatch()
 				local data = rawget(parts, part)
 				if data then
 					pendingOps[part] = true
+					deferredCount += 1
 					
 					task.defer(function()
 						if part and part.Parent and part.Parent ~= hiddenFolder then
-							disableEffects(part)
+							disableEffects(data.effects)
 							part.Parent = hiddenFolder
 							data.hidden = true
 							addToHidden(part)
 						end
 						pendingOps[part] = nil
+						deferredCount -= 1
 					end)
 					
 					processed += 1
@@ -317,7 +350,7 @@ local function processBatch()
 	
 	processed = 0
 	
-	while processed < 8 and restoreIndex <= restoreLen do
+	while processed < 4 and restoreIndex <= restoreLen and deferredCount < 8 do
 		local part = toRestore[restoreIndex]
 		
 		if part and part.Parent == hiddenFolder and not rawget(pendingOps, part) then
@@ -326,11 +359,12 @@ local function processBatch()
 				local parent = data.parent
 				if parent and parent.Parent then
 					pendingOps[part] = true
+					deferredCount += 1
 					
 					task.defer(function()
 						if part and part.Parent == hiddenFolder and parent.Parent then
 							part.Parent = parent
-							enableEffects(part)
+							enableEffects(data.effects)
 							data.hidden = false
 							removeFromHidden(part)
 						else
@@ -338,6 +372,7 @@ local function processBatch()
 							removeFromHidden(part)
 						end
 						pendingOps[part] = nil
+						deferredCount -= 1
 					end)
 					
 					processed += 1
@@ -390,7 +425,7 @@ connections.postsim = RunService.PostSimulation:Connect(function()
 	local now = os.clock()
 	local timeDelta = now - lastScan
 	
-	if distSq > 100 and timeDelta > 0.2 then
+	if distSq > 100 and timeDelta > 0.3 then
 		lastPlayerPos = currentPlayerPos
 		lastScan = now
 		hideIndex = 1
